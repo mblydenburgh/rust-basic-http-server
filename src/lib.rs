@@ -1,30 +1,30 @@
-use std::thread;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::thread;
 
 // Thread pool has a list of all available Workers as well as a Sender
 // to share jobs across multiple threads
 pub struct ThreadPool {
     workers: Vec<Worker>,
-    sender: mpsc::Sender<Job>
+    sender: mpsc::Sender<Message>,
 }
 // Holds job in a closure
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
 impl ThreadPool {
     /// Creates a new ThreadPool.
-    /// 
+    ///
     /// The size is the given number of threads in the pool
-    /// 
+    ///
     /// # Panics
-    /// 
+    ///
     /// The `new` function will panic if size == 0
     pub fn new(size: usize) -> ThreadPool {
         assert!(size > 0);
 
         // Create a new sender/receiver channel to handler multithreaded requests.
-        // The threadpool is created with the sender, and each Worker has a receiver to 
+        // The threadpool is created with the sender, and each Worker has a receiver to
         // get the code to execute in a closure. Arc is needed to share ownership
         // across multiple Workers.
         let (sender, receiver) = mpsc::channel();
@@ -53,7 +53,26 @@ impl ThreadPool {
     {
         let job = Box::new(f);
 
-        self.sender.send(job).unwrap();
+        self.sender.send(Message::NewJob(job)).unwrap();
+    }
+}
+
+impl Drop for ThreadPool {
+    fn drop(&mut self) {
+        println!("Sending terminate message to all workers");
+
+        for _ in &self.workers {
+            self.sender.send(Message::Terminate).unwrap();
+        }
+
+        println!("Shutting down all workers");
+
+        for worker in &mut self.workers {
+            println!("Shutting down worker {}", worker.id);
+            if let Some(thread) = worker.thread.take() {
+                thread.join().unwrap();
+            }
+        }
     }
 }
 
@@ -62,23 +81,40 @@ impl ThreadPool {
 // immediately execute its closure
 pub struct Worker {
     id: usize,
-    thread: thread::JoinHandle<()>
+    thread: Option<thread::JoinHandle<()>>,
 }
 
 impl Worker {
-    /// Creates a new thread Worker
+    /// Creates a new thread Worker or terminates an existing one.
+    /// 
     /// id is a number assigned to each worker for identification
-    /// receiver is a Arc<Mutex<Receiver<Job>>> messenger component
+    /// receiver is a Arc<Mutex<Receiver<Message>>> messenger component
     /// 
     /// # Panics
-    /// 
+    ///
     /// Will panic if another thread failed to unlock the messager
-    fn new(id: usize, receiver: Arc<Mutex<mpsc::Receiver<Job>>>) -> Worker {
+    fn new(id: usize, receiver: Arc<Mutex<mpsc::Receiver<Message>>>) -> Worker {
         let thread = thread::spawn(move || loop {
-            let job = receiver.lock().unwrap().recv().unwrap();
-            println!("Worker {} got a job; executing.", id);
-            job();
+            let message = receiver.lock().unwrap().recv().unwrap();
+            match message {
+                Message::NewJob(job) => {
+                    println!("Worker {} got a job; executing.", id);
+                    job();
+                }
+                Message::Terminate => {
+                    println!("Worker {} was told to terminate.", id);
+                    break;
+                }
+            }
         });
-        Worker { id, thread }
-    }   
+        Worker {
+            id,
+            thread: Some(thread),
+        }
+    }
+}
+
+enum Message {
+    NewJob(Job),
+    Terminate,
 }
